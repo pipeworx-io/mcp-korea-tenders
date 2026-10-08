@@ -1,0 +1,32 @@
+{
+  "name": "@pipeworx/mcp-korea-tenders",
+  "version": "0.1.0",
+  "description": "Korea Government Procurement MCP — KONEPS (나라장터 / g2b) open bids and",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "mcp-korea-tenders": "bin/cli.js"
+  },
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "korea-tenders"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipeworx-io/mcp-korea-tenders.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-faaf854239ff99fea5a65fc31e38e8633dafec82febf3702bd00df914087ce68",
+    "sourceCommit": "29efecb1e77577b1ce49e14f4fd7bbaee3e63885"
+  }
+}
