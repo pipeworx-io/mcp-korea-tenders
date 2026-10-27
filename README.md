@@ -4,9 +4,9 @@ Open South Korean government procurement: bid notices currently open on KONEPS
 (나라장터, the Public Procurement Service portal), Defense e-Procurement, LH,
 K-water and Nuri-jangteo, plus the suppliers that hold KONEPS contracts, all
 from Korean public-data-portal (data.go.kr) feeds as assembled by BOIM
-(boim.io). Keyless, live per request.
+(boim.io). Notices and vendors are keyless; award results are BYOK. Live per request.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1721+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1882+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -27,9 +27,18 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
   taxonomy (물품분류): all groups with their top categories, or every category
   in one group with its 8-digit code and vendor count.
 
+- `korea_get_awards(type?, from, to | notice_no, winner?, title?, limit?, page?, _apiKey)`
+  — BYOK. Multi-year award results (who won which bid): notice, buyer, winner
+  name and business number, award amount in KRW, award rate, bidder count.
+  Requires an API key: pass your own free data.go.kr service key as `_apiKey`.
+
 ## Auth
 
-Keyless.
+The four BOIM-backed tools are keyless. `korea_get_awards` is BYOK and requires
+an API key (Bruce's ruling, fleet #3423): there is no platform key. Register
+free at <https://www.data.go.kr>, apply for the Public Procurement Service
+successful-bid information service, and pass the key as `_apiKey`. Without one
+the tool refuses with "requires an API key" and says where to get it.
 
 ## Data sources
 
@@ -113,7 +122,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1721+ data sources. The
+Both URLs reach the same gateway and the same 1882+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

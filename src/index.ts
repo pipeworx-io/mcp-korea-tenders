@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -670,6 +686,254 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
 /**
  * Korea Government Procurement MCP — KONEPS (나라장터 / g2b) open bids and
  * procurement vendors, via BOIM (boim.io), keyless.
@@ -686,8 +950,10 @@ function collapse(s: string): string {
  * per-request MCP/API use within its free range and forbid bulk collection,
  * which is exactly the proxy shape this pack has: every call goes upstream.
  *
- * The official KONEPS open API on data.go.kr needs a registered service key;
- * none is held, which is why the route is BOIM rather than data.go.kr.
+ * Notices and vendor cards route through BOIM, keyless. Multi-year AWARD
+ * results (korea_get_awards) need a registered data.go.kr service key; none is
+ * held, so that one tool is BYOK: the caller passes their own key as _apiKey
+ * and the refusal without one says so (Bruce, fleet #3423, 2026-10-22).
  *
  * BOIM matches a single Korean phrase. English queries are mapped to one
  * Korean procurement term through a small alias table (see ALIASES); anything
@@ -699,6 +965,16 @@ const UA = 'pipeworx-mcp-korea-tenders/1.0 (+https://pipeworx.io)';
 const BOIM_MCP = 'https://boim.io/api/mcp';
 const SOURCE =
   'KONEPS (나라장터), Defense e-Procurement, LH, K-water and Nuri-jangteo bid notices from the Korean public-data portal (data.go.kr), assembled by BOIM (boim.io)';
+
+const AWARDS_BASE = 'https://apis.data.go.kr/1230000/as/ScsbidInfoService';
+const AWARDS_OPS: Record<string, string> = {
+  goods: 'getScsbidListSttusThng',
+  services: 'getScsbidListSttusServc',
+  construction: 'getScsbidListSttusCnstwk',
+};
+const AWARDS_KEY_DESC =
+  'Your own data.go.kr service key. korea_get_awards requires an API key; there is no platform key. Register free at https://www.data.go.kr and apply for the Public Procurement Service successful-bid information service; the key is issued under My Page. Either the encoded or decoded form of the key works.';
+const SOURCE_AWARDS = 'Public Procurement Service (조달청), successful-bid information, Korean public-data portal (data.go.kr)';
 
 const TENDER_DEFAULT_LIMIT = 20;
 const TENDER_MAX_LIMIT = 50;
@@ -966,6 +1242,27 @@ const tools: McpToolExport['tools'] = [
           description: `Max notices to return (default ${TENDER_DEFAULT_LIMIT}, max ${TENDER_MAX_LIMIT}).`,
         },
       },
+    },
+  },
+  {
+    name: 'korea_get_awards',
+    description:
+      'BYOK. Requires an API key: South Korean public-procurement AWARD results (who won which bid) from the Public Procurement Service successful-bid records, multi-year, not just the last 12 months. Pass your own free Korean public-data-portal (data.go.kr) service key as _apiKey; there is no platform key. Get one free by registering at https://www.data.go.kr and applying for the Public Procurement Service successful-bid information service. Filter by procurement type (goods, services, construction), award date window (max 31 days per call), notice number, winner-name text and notice-title text. Returns per award: notice number and title, buyer, winner name and business number, award amount in KRW, award rate, number of bidders, opening date. Example: korea_get_awards({ type: "services", from: "2024-03-01", to: "2024-03-31", _apiKey: "your-key" })',
+    summary: 'BYOK. Korean public-procurement award results (winners, amounts) by type and date window; needs your own data.go.kr key.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        type: { type: 'string', description: 'goods, services or construction (default services).' },
+        from: { type: 'string', description: 'Award window start, YYYY-MM-DD.' },
+        to: { type: 'string', description: 'Award window end, YYYY-MM-DD (at most 31 days after from).' },
+        notice_no: { type: 'string', description: 'Look up one bid notice number instead of a date window.' },
+        winner: { type: 'string', description: 'Keep only awards whose winner name contains this text (Korean, as registered).' },
+        title: { type: 'string', description: 'Keep only awards whose notice title contains this text (Korean).' },
+        limit: { type: ['number', 'string'], description: 'Max awards to return (default 20, max 100).' },
+        page: { type: ['number', 'string'], description: 'Upstream page, 1-based (each page is up to 100 records before the winner/title filter).' },
+        _apiKey: { type: 'string', description: AWARDS_KEY_DESC },
+      },
+      required: ['_apiKey'],
     },
   },
   {
@@ -1257,6 +1554,117 @@ async function listCategories(args: Record<string, unknown>): Promise<unknown> {
   };
 }
 
+
+function kstDate(v: string, label: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+  if (!m) throw new Error(`korea_get_awards: ${label} must be YYYY-MM-DD, got ${JSON.stringify(v)}`);
+  return `${m[1]}${m[2]}${m[3]}`;
+}
+
+async function getAwards(args: Record<string, unknown>, apiKey: string): Promise<unknown> {
+  const rawType = (strArg(args.type) ?? 'services').toLowerCase();
+  const op = AWARDS_OPS[rawType];
+  if (!op) throw new Error(`korea_get_awards: type must be goods, services or construction; got ${JSON.stringify(rawType)}`);
+  const noticeNo = strArg(args.notice_no);
+  const from = strArg(args.from);
+  const to = strArg(args.to);
+  const limit = clampLimit(args.limit, 20, 100);
+  const page = clampLimit(args.page, 1, 1000);
+
+  const params = new URLSearchParams();
+  let key = apiKey.trim();
+  if (key.includes('%')) {
+    try { key = decodeURIComponent(key); } catch { /* use as given */ }
+  }
+  params.set('serviceKey', key);
+  params.set('type', 'json');
+  params.set('pageNo', String(page));
+  params.set('numOfRows', '100');
+  if (noticeNo) {
+    params.set('inqryDiv', '2');
+    params.set('bidNtceNo', noticeNo);
+  } else {
+    if (!from || !to) throw new Error('korea_get_awards: pass from and to (YYYY-MM-DD), or notice_no');
+    const f = kstDate(from, 'from');
+    const t = kstDate(to, 'to');
+    const days = (Date.parse(to) - Date.parse(from)) / 86400000;
+    if (!(days >= 0)) throw new Error('korea_get_awards: to must not be before from');
+    if (days > 31) throw new Error('korea_get_awards: the award window is at most 31 days per call; split the range');
+    params.set('inqryDiv', '1');
+    params.set('inqryBgnDt', `${f}0000`);
+    params.set('inqryEndDt', `${t}2359`);
+  }
+
+  const res = await pwFetch(`${AWARDS_BASE}/${op}?${params.toString()}`);
+  const text = await res.text();
+  let body: Record<string, any>;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    if (!res.ok) throw new Error(`data.go.kr successful-bid information HTTP ${res.status}: ${summarizeErrorBody(text)}`);
+    throw new Error(`data.go.kr returned a non-JSON body (HTTP ${res.status}): ${summarizeErrorBody(text)}`);
+  }
+  const fault = body.OpenAPI_ServiceResponse?.cmmMsgHeader;
+  if (fault) {
+    const msg = String(fault.errMsg ?? '');
+    if (/SERVICE_KEY/i.test(msg) || /KEY/i.test(msg)) {
+      throw new Error(
+        `korea_get_awards requires an API key that data.go.kr accepts; it answered ${msg}. Register a free key at https://www.data.go.kr, apply for the Public Procurement Service successful-bid information service, and pass it as _apiKey (a new key can take up to an hour to activate).`,
+      );
+    }
+    throw new Error(`data.go.kr refused the request: ${msg} (${fault.returnAuthMsg ?? ''})`);
+  }
+  const resp = body.response ?? body;
+  const header = resp.header ?? {};
+  if (header.resultCode && String(header.resultCode) !== '00') {
+    throw new Error(`data.go.kr successful-bid information error ${header.resultCode}: ${header.resultMsg ?? ''}`);
+  }
+  const b = resp.body ?? {};
+  let items: Row[] = [];
+  if (Array.isArray(b.items)) items = b.items as Row[];
+  else if (b.items && Array.isArray(b.items.item)) items = b.items.item as Row[];
+  else if (b.items && typeof b.items.item === 'object') items = [b.items.item as Row];
+  const total = num(b.totalCount);
+
+  const w = strArg(args.winner);
+  const ti = strArg(args.title);
+  const awards = items
+    .map((r) => ({
+      notice_no: str(r.bidNtceNo),
+      notice_order: str(r.bidNtceOrd),
+      title: str(r.bidNtceNm),
+      buyer: str(r.ntceInsttNm) ?? str(r.dminsttNm),
+      winner: str(r.bidwinnrNm),
+      winner_business_no: str(r.bidwinnrBizno),
+      winner_representative: str(r.bidwinnrCeoNm),
+      award_amount_krw: num(r.sucsfbidAmt),
+      award_rate_pct: num(r.sucsfbidRate),
+      bidders: num(r.prtcptCnum),
+      opened_at: str(r.rlOpengDt),
+      award_date: str(r.fnlSucsfDate),
+    }))
+    .filter((a) => (!w || (a.winner ?? '').includes(w)) && (!ti || (a.title ?? '').includes(ti)));
+  const shown = awards.slice(0, limit);
+
+  return {
+    source: SOURCE_AWARDS,
+    data_as_of: new Date().toISOString(),
+    type: rawType,
+    window: noticeNo ? { notice_no: noticeNo } : { from, to },
+    page,
+    upstream_total: total,
+    upstream_page_records: items.length,
+    count: shown.length,
+    awards: shown,
+    note:
+      shown.length === 0
+        ? 'No award matched on this upstream page. The winner/title filters apply to the 100 records of the page only; try page 2 or drop the filters.'
+        : (total ?? 0) > page * 100
+          ? 'More records exist upstream; pass page to read on. Filters apply per page.'
+          : undefined,
+  };
+}
+
 // ---- helpers -------------------------------------------------------------------
 
 function str(v: unknown): string | null {
@@ -1295,7 +1703,16 @@ function clampLimit(v: unknown, def: number, max: number): number {
 }
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  const apiKey = typeof args._apiKey === 'string' ? args._apiKey.trim() : '';
+  delete args._apiKey;
   switch (name) {
+    case 'korea_get_awards':
+      if (!apiKey) {
+        throw new Error(
+          'korea_get_awards requires an API key. This tool is BYOK: there is no platform key. Pass your own free data.go.kr service key as _apiKey (register at https://www.data.go.kr and apply for the Public Procurement Service successful-bid information service). The other korea tools need no key.',
+        );
+      }
+      return getAwards(args, apiKey);
     case 'korea_search_tenders':
       return searchTenders(args);
     case 'korea_search_vendors':

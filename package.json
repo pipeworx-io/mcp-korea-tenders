@@ -1,7 +1,7 @@
 {
   "name": "@pipeworx/mcp-korea-tenders",
-  "version": "0.1.0",
-  "description": "Korea Government Procurement MCP — KONEPS (나라장터 / g2b) open bids and",
+  "version": "0.1.1",
+  "description": "Korea Government Procurement MCP — KONEPS (나라장터 / g2b) open bids and procurement vendors, via BOIM (boim.io), keyless.",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-faaf854239ff99fea5a65fc31e38e8633dafec82febf3702bd00df914087ce68",
-    "sourceCommit": "29efecb1e77577b1ce49e14f4fd7bbaee3e63885"
+    "sourceHash": "v1-5756edff12571dd41f7dd24b24d04a661e3a72f7e94244a152bb39264d19e559",
+    "sourceCommit": "33741fe6d9ba71856e73fa683c73572d1ddf2e93"
   }
 }
