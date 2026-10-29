@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/korea-tenders",
   "title": "Korea Tenders",
   "description": "Korea Government Procurement MCP — KONEPS (나라장터 / g2b) open bids and procurement vendors, via BOIM…",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "websiteUrl": "https://pipeworx.io/packs/korea-tenders",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-korea-tenders",
